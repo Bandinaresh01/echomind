@@ -1,0 +1,13 @@
+flask
+python-dotenv
+
+livekit>=1.0.19,<2
+livekit-api>=1.0.2,<2
+
+numpy
+torch
+openai-whisper
+google-generativeai
+
+requests
+beautifulsoup4

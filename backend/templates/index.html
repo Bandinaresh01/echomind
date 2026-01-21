@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>EchoMind – LiveKit + Voice + Tools</title>
+
+  <!-- LiveKit JS SDK (UMD) - FIX: reliable CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.js"></script>
+
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+
+<body>
+  <div class="container">
+    <header>
+      <h1>EchoMind</h1>
+      <p class="subtitle">LiveKit session + Voice input + Tool-using Gemini agent</p>
+    </header>
+
+    <section class="card">
+      <div class="row">
+        <button id="btnStart" class="primary" onclick="toggleStart()">🎤 Start</button>
+
+        <label class="switch">
+          <input id="ttsToggle" type="checkbox" />
+          <span class="slider"></span>
+        </label>
+        <span class="switchLabel">Speak answer</span>
+      </div>
+
+      <div class="statusRow">
+        <span class="badge" id="lkStatus">LiveKit: idle</span>
+        <span class="badge" id="sttStatus">STT: idle</span>
+        <span class="badge tool" id="toolUsed">Tool: -</span>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Ask (Text)</h2>
+      <div class="row">
+        <input id="textInput" placeholder="Type a question (or use voice)..." />
+        <button class="secondary" onclick="askFromText()">Ask</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Recognized Text</h2>
+      <div id="recognized" class="box"></div>
+    </section>
+
+    <section class="card">
+      <h2>Answer</h2>
+      <div id="answer" class="box"></div>
+    </section>
+
+    <section class="card">
+      <h2>Debug Log</h2>
+      <pre id="log" class="log"></pre>
+    </section>
+  </div>
+
+<script>
+  let started = false;
+  let room = null;
+  let recognition = null;
+
+  const logEl = document.getElementById("log");
+  const lkStatusEl = document.getElementById("lkStatus");
+  const sttStatusEl = document.getElementById("sttStatus");
+  const toolUsedEl = document.getElementById("toolUsed");
+  const btnEl = document.getElementById("btnStart");
+  const recognizedEl = document.getElementById("recognized");
+  const answerEl = document.getElementById("answer");
+
+  function log(msg) {
+    logEl.textContent += msg + "\n";
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function setBadge(el, text) { el.textContent = text; }
+
+  function speak(text) {
+    const enabled = document.getElementById("ttsToggle").checked;
+    if (!enabled) return;
+    try {
+      const u = new SpeechSynthesisUtterance(text);
+      u.rate = 1.0;
+      speechSynthesis.cancel();
+      speechSynthesis.speak(u);
+    } catch (e) {
+      log("TTS error: " + e);
+    }
+  }
+
+  async function toggleStart() {
+    if (!started) return startSession();
+    return stopSession();
+  }
+
+  async function startSession() {
+    logEl.textContent = "";
+    recognizedEl.textContent = "";
+    answerEl.textContent = "";
+    toolUsedEl.textContent = "Tool: -";
+
+    // FIX: support both possible global names
+    const LK = window.LiveKitClient || window.LivekitClient;
+    if (!LK) {
+      log("❌ LiveKit SDK not loaded.");
+      log("Try opening this in browser to confirm it loads:");
+      log("https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.js");
+      return;
+    }
+
+    started = true;
+    btnEl.textContent = "⏹ Stop";
+    setBadge(lkStatusEl, "LiveKit: starting...");
+    setBadge(sttStatusEl, "STT: starting...");
+
+    // 1) Start backend session and get token/room/url
+    log("Fetching token...");
+    const res = await fetch("/api/start", { method: "POST" });
+    const data = await res.json();
+
+    if (data.error) {
+      log("❌ /api/start error: " + data.error);
+      started = false;
+      btnEl.textContent = "🎤 Start";
+      setBadge(lkStatusEl, "LiveKit: error");
+      setBadge(sttStatusEl, "STT: idle");
+      return;
+    }
+
+    log(`Room: ${data.room}, Identity: ${data.identity}`);
+    log(`Connecting to: ${data.url}`);
+
+    // 2) Connect to LiveKit
+    room = new LK.Room();
+
+    room.on(LK.RoomEvent.ConnectionStateChanged, (state) => {
+      log("LiveKit state: " + state);
+      setBadge(lkStatusEl, "LiveKit: " + state);
+    });
+
+    room.on(LK.RoomEvent.Connected, () => log("✅ LiveKit connected"));
+    room.on(LK.RoomEvent.Disconnected, () => log("❌ LiveKit disconnected"));
+
+    await room.connect(data.url, data.token);
+
+    // 3) Enable mic in LiveKit (permissions + device access)
+    await room.localParticipant.setMicrophoneEnabled(true);
+    log("✅ Mic enabled via LiveKit.");
+
+    // 4) Start Browser STT (no paid key)
+    setBadge(sttStatusEl, "STT: listening");
+    startBrowserSTT();
+  }
+
+  async function stopSession() {
+    log("Stopping...");
+    started = false;
+    btnEl.textContent = "🎤 Start";
+
+    stopBrowserSTT();
+
+    try { await fetch("/api/stop", { method: "POST" }); } catch {}
+
+    try { if (room) room.disconnect(); } catch {}
+    room = null;
+
+    setBadge(lkStatusEl, "LiveKit: idle");
+    setBadge(sttStatusEl, "STT: idle");
+    log("Stopped cleanly.");
+  }
+
+  function startBrowserSTT() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+      log("❌ Browser STT not supported. Use Chrome/Edge.");
+      setBadge(sttStatusEl, "STT: not supported");
+      return;
+    }
+
+    recognition = new SR();
+    recognition.lang = "en-US";
+    recognition.interimResults = true;
+    recognition.continuous = true;
+
+    let finalText = "";
+
+    recognition.onstart = () => log("🎧 STT started");
+    recognition.onerror = (e) => log("STT error: " + (e.error || e));
+
+    recognition.onend = () => {
+      log("🎧 STT ended");
+      if (started) {
+        // auto restart while session running
+        try { recognition.start(); } catch {}
+      }
+    };
+
+    recognition.onresult = async (event) => {
+      let interim = "";
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const txt = event.results[i][0].transcript;
+        if (event.results[i].isFinal) finalText += txt + " ";
+        else interim += txt;
+      }
+
+      const shown = (finalText + interim).trim();
+      recognizedEl.textContent = shown;
+
+      // When we have a final sentence, send to backend
+      if (finalText.trim() && !interim.trim()) {
+        const question = finalText.trim();
+        finalText = "";
+        await askBackend(question);
+      }
+    };
+
+    try { recognition.start(); } catch (e) { log("STT start error: " + e); }
+  }
+
+  function stopBrowserSTT() {
+    try { if (recognition) recognition.stop(); } catch {}
+    recognition = null;
+  }
+
+  async function askBackend(question) {
+    log("🧠 Asking: " + question);
+
+    const res = await fetch("/api/ask", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: question })
+    });
+
+    const data = await res.json();
+    if (data.error) {
+      answerEl.textContent = data.error;
+      log("❌ /api/ask error: " + data.error);
+      return;
+    }
+
+    toolUsedEl.textContent = "Tool: " + (data.tool_used || "-");
+    answerEl.textContent = data.answer || "";
+    speak(data.answer || "");
+  }
+
+  async function askFromText() {
+    const input = document.getElementById("textInput");
+    const q = (input.value || "").trim();
+    if (!q) return;
+
+    recognizedEl.textContent = q;
+    input.value = "";
+    await askBackend(q);
+  }
+</script>
+</body>
+</html>
