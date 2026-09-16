@@ -1,0 +1,4 @@
+env/
+tests/
+__pycache__/
+installed_reqs.txt
